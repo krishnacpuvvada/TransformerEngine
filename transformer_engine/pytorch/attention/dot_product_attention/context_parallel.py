@@ -4,6 +4,7 @@
 
 """Context Parallelism."""
 import os
+import warnings
 from typing import List, Union, Tuple
 import torch
 import transformer_engine_torch as tex
@@ -49,6 +50,11 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     combine_and_dequantize,
     print_quantizers,
     mxfp8_quantize_fast_path,
+)
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_swa import (
+    AttnFuncWithCPAndKVP2PSWA,
+    get_halo_kv_seqlens,
+    use_p2p_swa,
 )
 
 _cu_seqlens_info_with_cp_cache = {}
@@ -5434,6 +5440,7 @@ def cp_per_step_configs(
     attn_mask_type,
     window_size,
     bottom_right_diagonal,
+    qkv_format,
 ):
     """Per-step attention configs a context-parallel run dispatches to its attention backend.
 
@@ -5459,6 +5466,26 @@ def cp_per_step_configs(
             "window_size_right": w_right,
             "bottom_right_diagonal": bottom_right,
         }
+
+    if cp_comm_type == "p2p" and window_size not in [(-1, 0), (-1, -1)]:
+        # sliding window over p2p: one call per chunk over [halo, chunk], else all-gather
+        if use_p2p_swa(qkv_format, attn_mask_type, window_size, max_seqlen_kv, cp_size):
+            chunk_len = max_seqlen_kv // (2 * cp_size)
+            return [
+                config(
+                    "causal_bottom_right",
+                    chunk_len,
+                    s_kv,
+                    num_heads,
+                    num_gqa_groups,
+                    True,
+                    num_tokens_q,
+                    num_tokens_kv,
+                    window=(window_left, 0),
+                )
+                for s_kv in get_halo_kv_seqlens(cp_size, chunk_len, window_left)
+            ]
+        cp_comm_type = "all_gather"
 
     if cp_comm_type == "a2a":
         # split heads across the cp ranks
@@ -5707,9 +5734,26 @@ def attn_forward_func_with_cp(
     sliding_window_attn = (
         window_size is not None and window_size != (-1, 0) and window_size != (-1, -1)
     )
+    if sliding_window_attn and cp_comm_type == "p2p":
+        cp_size = get_distributed_world_size(cp_group)
+        if use_fused_attention and use_p2p_swa(
+            qkv_format, attn_mask_type, window_size, max_seqlen_kv, cp_size
+        ):
+            cp_comm_type = "p2p_swa"
+        elif use_fused_attention or use_flash_attn_3 or use_flash_attn_4 or qkv_format != "thd":
+            # all_gather covers the remaining sliding-window cases, except THD with
+            # FlashAttention 2, which lacks the seqused_k it needs on the gathered K/V
+            warnings.warn(
+                "Sliding window attention with cp_comm_type='p2p' is only communicated"
+                " point-to-point for dense causal attention with a left window of at most"
+                " (cp_size - 1) sequence chunks on the FusedAttention backend; falling back to"
+                " all_gather."
+            )
+            cp_comm_type = "all_gather"
     assert not sliding_window_attn or cp_comm_type in [
         "a2a",
         "all_gather",
+        "p2p_swa",
     ], f"Context parallelism does not support sliding window attention with {cp_comm_type=}!"
 
     assert (
@@ -5762,6 +5806,21 @@ def attn_forward_func_with_cp(
             layer_number,
         ]
         out = AttnFuncWithCPAndKVP2P.apply(*args)
+    elif cp_comm_type == "p2p_swa":
+        out = AttnFuncWithCPAndKVP2PSWA.apply(
+            is_training,
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            qkv_format,
+            deterministic,
+            return_max_logit,
+            window_size,
+            cp_group,
+            cp_global_ranks,
+        )
     elif cp_comm_type == "all_gather":
         args += [
             window_size,

@@ -1360,12 +1360,23 @@ def get_attention_backend(
         elif (
             window_size is not None
             and (window_size[0] != -1 or window_size[1] not in [-1, 0])
-            and cp_comm_type in ["p2p", "a2a+p2p"]
+            and cp_comm_type == "a2a+p2p"
         ):
             logger.debug(
                 "Disabling FusedAttention as it does not support context parallelism with sliding"
                 " window attention and cp_comm_type = %s",
                 cp_comm_type,
+            )
+            use_fused_attention = False
+        elif (
+            window_size is not None
+            and (window_size[0] != -1 or window_size[1] not in [-1, 0])
+            and cp_comm_type == "p2p"
+            and core_attention_bias_type != "no_bias"
+        ):
+            logger.debug(
+                "Disabling FusedAttention as it does not support context parallelism with sliding"
+                " window attention, bias and cp_comm_type = p2p"
             )
             use_fused_attention = False
         elif cp_comm_type in ["a2a", "a2a+p2p"] and (num_heads % 2 != 0 or num_gqa_groups % 2 != 0):
@@ -1670,6 +1681,7 @@ def get_attention_backend(
                 attn_mask_type=attn_mask_type,
                 window_size=window_size,
                 bottom_right_diagonal=bottom_right_diagonal,
+                qkv_format=qkv_format,
             )
         else:
             per_step_configs = [None]

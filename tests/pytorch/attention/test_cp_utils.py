@@ -18,6 +18,13 @@ from transformer_engine.pytorch.attention.dot_product_attention.context_parallel
     pad_thd_sequences_for_cp,
     generate_positional_ids_for_cp,
 )
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_swa import (
+    get_chunk_owner,
+    get_halo_kv_seqlens,
+    get_halo_length,
+    get_halo_pieces,
+    use_p2p_swa,
+)
 from transformer_engine.pytorch.attention.dot_product_attention.utils import get_thd_padding_mask
 
 try:
@@ -1077,6 +1084,82 @@ class TestTHDKernels(unittest.TestCase):
         expected_packed = torch.cat([packed_lse[:, 4:8], packed_lse[:, 12:16]], dim=1)
         self.assertTrue(torch.equal(second_half_lse, expected))
         self.assertTrue(torch.equal(packed_second_half_lse, expected_packed))
+
+
+class TestP2PSWAHalo(unittest.TestCase):
+    """Halo exchange schedule for sliding window attention with cp_comm_type='p2p'."""
+
+    def test_pieces_cover_exactly_the_halo(self):
+        for cp_size, chunk_len in itertools.product([1, 2, 3, 4, 8], [1, 3, 8]):
+            seqlen = 2 * cp_size * chunk_len
+            for window in range(1, seqlen + 2):
+                pieces = get_halo_pieces(cp_size, chunk_len, window)
+                self.assertEqual(pieces, sorted(pieces, key=lambda p: (p.dst_chunk, p.src_chunk)))
+                for dst_chunk in range(2 * cp_size):
+                    halo = get_halo_length(dst_chunk, chunk_len, window)
+                    end = 0
+                    for piece in [p for p in pieces if p.dst_chunk == dst_chunk]:
+                        self.assertLess(piece.src_chunk, dst_chunk)
+                        self.assertGreaterEqual(piece.src_start, 0)
+                        self.assertLessEqual(piece.src_start + piece.length, chunk_len)
+                        # consecutive in the halo, and mapping to the right global positions
+                        self.assertEqual(piece.dst_start, end)
+                        self.assertEqual(
+                            piece.src_chunk * chunk_len + piece.src_start,
+                            dst_chunk * chunk_len - halo + piece.dst_start,
+                        )
+                        end += piece.length
+                    self.assertEqual(end, halo)
+
+    def test_every_rank_sends_and_receives(self):
+        for cp_size in [2, 3, 4, 8]:
+            pieces = get_halo_pieces(cp_size, 4, 1)
+            owners = [
+                (get_chunk_owner(p.src_chunk, cp_size), get_chunk_owner(p.dst_chunk, cp_size))
+                for p in pieces
+            ]
+            for rank in range(cp_size):
+                self.assertTrue(any(src == rank != dst for src, dst in owners))
+                self.assertTrue(any(dst == rank != src for src, dst in owners))
+
+    def test_per_chunk_masks_reproduce_the_global_window(self):
+        for cp_size, chunk_len in itertools.product([2, 4, 8], [2, 4]):
+            seqlen = 2 * cp_size * chunk_len
+            windows = [1, chunk_len - 1, chunk_len, chunk_len + 1, 2 * chunk_len, seqlen]
+            for window in windows:
+                pos = torch.arange(seqlen)
+                expected = (pos[None, :] <= pos[:, None]) & (pos[:, None] - pos[None, :] <= window)
+                actual = torch.zeros(seqlen, seqlen, dtype=torch.bool)
+                for chunk_id in range(2 * cp_size):
+                    halo = get_halo_length(chunk_id, chunk_len, window)
+                    q_pos = chunk_id * chunk_len + torch.arange(chunk_len)
+                    kv_pos = chunk_id * chunk_len - halo + torch.arange(chunk_len + halo)
+                    # causal_bottom_right with window (window, 0) in the coordinates of the call
+                    i = torch.arange(chunk_len)[:, None] + halo
+                    j = torch.arange(chunk_len + halo)[None, :]
+                    actual[q_pos[:, None], kv_pos[None, :]] = (j <= i) & (i - j <= window)
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_kv_seqlens(self):
+        self.assertEqual(get_halo_kv_seqlens(4, 8, 3), [8, 11])
+        self.assertEqual(get_halo_kv_seqlens(4, 8, 8), [8, 16])
+        self.assertEqual(get_halo_kv_seqlens(4, 8, 20), [8, 16, 24, 28])
+
+    def test_use_p2p_swa(self):
+        # dense causal left window no wider than (cp_size - 1) chunks; max_seqlen is global
+        self.assertTrue(use_p2p_swa("bshd", "causal", (128, 0), 4096, 2))
+        self.assertTrue(use_p2p_swa("sbhd", "causal", (1024, 0), 4096, 2))
+        self.assertFalse(use_p2p_swa("bshd", "causal", (1025, 0), 4096, 2))
+        self.assertTrue(use_p2p_swa("bshd", "causal", (1025, 0), 4096, 4))
+        for qkv_format, attn_mask_type, window_size in [
+            ("thd", "padding_causal", (128, 0)),
+            ("bshd", "no_mask", (128, 128)),
+            ("bshd", "causal_bottom_right", (128, 0)),
+            ("bshd", "causal", (-1, 0)),
+            ("bshd", "causal", (0, 0)),
+            ("bshd", "causal", None),
+        ]:
+            self.assertFalse(use_p2p_swa(qkv_format, attn_mask_type, window_size, 4096, 2))
 
 
 if __name__ == "__main__":
