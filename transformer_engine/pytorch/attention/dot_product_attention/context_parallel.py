@@ -5474,7 +5474,7 @@ def cp_per_step_configs(
             chunk_len = max_seqlen_kv // (2 * cp_size)
             return [
                 config(
-                    "causal_bottom_right",
+                    "padding_causal_bottom_right" if qkv_format == "thd" else "causal_bottom_right",
                     chunk_len,
                     s_kv,
                     num_heads,
@@ -5748,9 +5748,9 @@ def attn_forward_func_with_cp(
             # FlashAttention 2, which lacks the seqused_k it needs on the gathered K/V
             warnings.warn(
                 "Sliding window attention with cp_comm_type='p2p' is only communicated"
-                " point-to-point for dense causal BF16/FP16 attention with a left window of at"
-                " most (cp_size - 1) sequence chunks on the FusedAttention backend; falling back"
-                " to all_gather."
+                " point-to-point for causal BF16/FP16 attention with a left window of at most"
+                " (cp_size - 1) sequence chunks on the FusedAttention backend; falling back to"
+                " all_gather."
             )
             cp_comm_type = "all_gather"
     assert not sliding_window_attn or cp_comm_type in [
@@ -5815,6 +5815,10 @@ def attn_forward_func_with_cp(
             q,
             k,
             v,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            cu_seqlens_q_padded,
+            cu_seqlens_kv_padded,
             dropout_p,
             softmax_scale,
             qkv_format,

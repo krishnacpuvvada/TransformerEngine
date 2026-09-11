@@ -20,10 +20,12 @@ from transformer_engine.pytorch.attention.dot_product_attention.context_parallel
     generate_positional_ids_for_cp,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_swa import (
+    _packed_seqlens,
     get_chunk_owner,
     get_halo_kv_seqlens,
     get_halo_length,
     get_halo_pieces,
+    get_local_chunks,
     use_p2p_swa,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import get_thd_padding_mask
@@ -1147,13 +1149,15 @@ class TestP2PSWAHalo(unittest.TestCase):
         self.assertEqual(get_halo_kv_seqlens(4, 8, 20), [8, 16, 24, 28])
 
     def test_use_p2p_swa(self):
-        # dense causal left window no wider than (cp_size - 1) chunks; max_seqlen is global
+        # causal left window no wider than (cp_size - 1) chunks; max_seqlen is global
         self.assertTrue(use_p2p_swa("bshd", "causal", (128, 0), 4096, 2))
         self.assertTrue(use_p2p_swa("sbhd", "causal", (1024, 0), 4096, 2))
+        self.assertTrue(use_p2p_swa("thd", "padding_causal", (128, 0), 4096, 2))
         self.assertFalse(use_p2p_swa("bshd", "causal", (1025, 0), 4096, 2))
         self.assertTrue(use_p2p_swa("bshd", "causal", (1025, 0), 4096, 4))
         for qkv_format, attn_mask_type, window_size in [
-            ("thd", "padding_causal", (128, 0)),
+            ("thd", "causal", (128, 0)),
+            ("thd", "padding", (128, 128)),
             ("bshd", "no_mask", (128, 128)),
             ("bshd", "causal_bottom_right", (128, 0)),
             ("bshd", "causal", (-1, 0)),
@@ -1161,6 +1165,26 @@ class TestP2PSWAHalo(unittest.TestCase):
             ("bshd", "causal", None),
         ]:
             self.assertFalse(use_p2p_swa(qkv_format, attn_mask_type, window_size, 4096, 2))
+
+    def test_local_chunks_and_packed_seqlens(self):
+        # rank 1 of 2 owns chunks 1 and 2 of every sequence; two sequences with chunk lengths
+        # 8 and 4, window 6, actual lengths 15 and 5 (so the high chunks hold no valid query)
+        chunks, ext_total = get_local_chunks(1, 2, 6, [8, 4])
+        self.assertEqual(
+            [tuple(c) for c in chunks],
+            [
+                (0, 0, 1, 0, 8, 6, 0),
+                (0, 1, 2, 8, 8, 6, 0),
+                (1, 0, 1, 16, 4, 4, 14),
+                (1, 1, 2, 20, 4, 6, 14),
+            ],
+        )
+        self.assertEqual(ext_total, [22, 24])
+        low = [t.tolist() for t in _packed_seqlens(chunks, ext_total, [15, 5], 24, 0, "cpu")]
+        high = [t.tolist() for t in _packed_seqlens(chunks, ext_total, [15, 5], 24, 1, "cpu")]
+        # (valid queries, query offsets, valid keys, key offsets)
+        self.assertEqual(low, [[0, 7, 8], [0, 16, 24], [0, 13, 18], [0, 14, 22]])
+        self.assertEqual(high, [[0, 0, 0], [8, 20, 24], [0, 5, 8], [0, 14, 24]])
 
     def test_per_step_configs_follow_the_route(self):
         # backend selection must probe the graphs of the path that will actually run
