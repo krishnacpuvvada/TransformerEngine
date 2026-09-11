@@ -10,6 +10,7 @@ import unittest
 from transformer_engine.pytorch import CPLoadBalancingStrategy
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
     _zero_thd_padding,
+    cp_per_step_configs,
     get_batch_on_this_cp_rank,
     get_no_load_balance_thd_causal_metadata,
     get_thd_partitioned_indices,
@@ -1160,6 +1161,38 @@ class TestP2PSWAHalo(unittest.TestCase):
             ("bshd", "causal", None),
         ]:
             self.assertFalse(use_p2p_swa(qkv_format, attn_mask_type, window_size, 4096, 2))
+
+    def test_per_step_configs_follow_the_route(self):
+        # backend selection must probe the graphs of the path that will actually run
+        def configs(cp_comm_type, window_size, fp8):
+            return cp_per_step_configs(
+                cp_comm_type,
+                2,
+                1,
+                max_seqlen_q=4096,
+                max_seqlen_kv=4096,
+                num_tokens_q=0,
+                num_tokens_kv=0,
+                num_heads=8,
+                num_gqa_groups=8,
+                attn_mask_type="causal",
+                window_size=window_size,
+                bottom_right_diagonal=False,
+                qkv_format="bshd",
+                fp8=fp8,
+            )
+
+        # halo path: one call per chunk, chunk 0 without a halo and the others with W keys
+        self.assertEqual(
+            [
+                (c["attn_mask_type"], c["max_seqlen_q"], c["max_seqlen_kv"], c["window_size_left"])
+                for c in configs("p2p", (128, 0), False)
+            ],
+            [("causal_bottom_right", 1024, 1024, 128), ("causal_bottom_right", 1024, 1152, 128)],
+        )
+        # FP8, and windows wider than (cp_size - 1) chunks, probe the all_gather graphs instead
+        self.assertEqual(configs("p2p", (128, 0), True), configs("all_gather", (128, 0), True))
+        self.assertEqual(configs("p2p", (2048, 0), False), configs("all_gather", (2048, 0), False))
 
 
 if __name__ == "__main__":

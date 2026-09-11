@@ -1682,6 +1682,7 @@ def get_attention_backend(
                 window_size=window_size,
                 bottom_right_diagonal=bottom_right_diagonal,
                 qkv_format=qkv_format,
+                fp8=fp8 and fp8_meta["recipe"].fp8_dpa,
             )
         else:
             per_step_configs = [None]

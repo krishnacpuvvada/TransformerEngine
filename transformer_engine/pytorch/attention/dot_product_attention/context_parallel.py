@@ -5441,6 +5441,7 @@ def cp_per_step_configs(
     window_size,
     bottom_right_diagonal,
     qkv_format,
+    fp8,
 ):
     """Per-step attention configs a context-parallel run dispatches to its attention backend.
 
@@ -5469,7 +5470,7 @@ def cp_per_step_configs(
 
     if cp_comm_type == "p2p" and window_size not in [(-1, 0), (-1, -1)]:
         # sliding window over p2p: one call per chunk over [halo, chunk], else all-gather
-        if use_p2p_swa(qkv_format, attn_mask_type, window_size, max_seqlen_kv, cp_size):
+        if not fp8 and use_p2p_swa(qkv_format, attn_mask_type, window_size, max_seqlen_kv, cp_size):
             chunk_len = max_seqlen_kv // (2 * cp_size)
             return [
                 config(
@@ -5736,8 +5737,10 @@ def attn_forward_func_with_cp(
     )
     if sliding_window_attn and cp_comm_type == "p2p":
         cp_size = get_distributed_world_size(cp_group)
-        if use_fused_attention and use_p2p_swa(
-            qkv_format, attn_mask_type, window_size, max_seqlen_kv, cp_size
+        if (
+            use_fused_attention
+            and not fp8
+            and use_p2p_swa(qkv_format, attn_mask_type, window_size, max_seqlen_kv, cp_size)
         ):
             cp_comm_type = "p2p_swa"
         elif use_fused_attention or use_flash_attn_3 or use_flash_attn_4 or qkv_format != "thd":
@@ -5745,9 +5748,9 @@ def attn_forward_func_with_cp(
             # FlashAttention 2, which lacks the seqused_k it needs on the gathered K/V
             warnings.warn(
                 "Sliding window attention with cp_comm_type='p2p' is only communicated"
-                " point-to-point for dense causal attention with a left window of at most"
-                " (cp_size - 1) sequence chunks on the FusedAttention backend; falling back to"
-                " all_gather."
+                " point-to-point for dense causal BF16/FP16 attention with a left window of at"
+                " most (cp_size - 1) sequence chunks on the FusedAttention backend; falling back"
+                " to all_gather."
             )
             cp_comm_type = "all_gather"
     assert not sliding_window_attn or cp_comm_type in [
