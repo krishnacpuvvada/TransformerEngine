@@ -841,7 +841,12 @@ class DotProductAttention(TransformerEngineBaseModule):
                   Can be ``"p2p"`` or ``"all_gather"`` or ``"a2a"`` or ``"a2a+p2p"``.
 
                   - ``"p2p"``: Exchange KV chunks with P2P communications in ring topology.
-                    P2P is async and can be overlapped with attention compute.
+                    P2P is async and can be overlapped with attention compute. For causal
+                    sliding window attention (``window_size=(W, 0)``) in ``bshd``/``sbhd``
+                    with FusedAttention, each rank instead fetches only the ``W`` keys that
+                    precede each of its sequence chunks from the ranks owning them; windows
+                    wider than ``cp_size - 1`` chunks and other sliding-window cases fall
+                    back to ``"all_gather"``.
                   - ``"all_gather"``: All-gather to get full sequence of KV before attention.
                     The all-gather is not async, and cannot be overlapped.
                   - ``"a2a"``: Like DeepSpeed Ulysses, scatter attention heads across the CP
@@ -1089,7 +1094,12 @@ class DotProductAttention(TransformerEngineBaseModule):
                       Can be ``"p2p"`` or ``"all_gather"`` or ``"a2a"`` or ``"a2a+p2p"``.
 
                       - ``"p2p"``: Exchange KV chunks with P2P communications in ring topology.
-                        P2P is async and can be overlapped with attention compute.
+                        P2P is async and can be overlapped with attention compute. For causal
+                        sliding window attention (``window_size=(W, 0)``) in ``bshd``/``sbhd``
+                        with FusedAttention, each rank instead fetches only the ``W`` keys that
+                        precede each of its sequence chunks from the ranks owning them; windows
+                        wider than ``cp_size - 1`` chunks and other sliding-window cases fall
+                        back to ``"all_gather"``.
                       - ``"all_gather"``: All-gather to get full sequence of KV before attention.
                         The all-gather is not async, and cannot be overlapped.
                       - ``"a2a"``: Like DeepSpeed Ulysses, scatter attention heads across the CP
