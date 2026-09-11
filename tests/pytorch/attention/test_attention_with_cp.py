@@ -523,6 +523,16 @@ model_configs_fused_attn = {
     "cp_2_6": ModelConfig(
         2, 4096, 12, 128, num_gqa_groups=2, attn_mask_type="causal", window_size=(512, 512)
     ),  # GQA
+    "cp_2_7": ModelConfig(
+        2,
+        3072,
+        16,
+        128,
+        num_gqa_groups=4,
+        attn_mask_type="causal",
+        window_size=(768, 0),
+        return_max_logit=True,
+    ),  # GQA, sequence divisible by 2 * cp_size for cp_size in {2, 3, 4}; window == chunk at CP2
     "cp_3_0": ModelConfig(2, 4096, 12, 128, attn_mask_type="causal", head_dim_v=64),  # MLA
     "cp_3_1": ModelConfig(2, 4096, 128, 192, head_dim_v=128, attn_mask_type="causal"),  # MLA
     "cp_3_2": ModelConfig(
@@ -546,6 +556,9 @@ model_configs_fused_attn = {
     ),  # GQA
     "cp_5_0": ModelConfig(2, 1024, 16, 256, attn_mask_type="causal"),
     "cp_5_1": ModelConfig(2, 1024, 16, 256, attn_mask_type="causal", window_size=(128, 0)),
+    "cp_5_2": ModelConfig(
+        2, 3072, 16, 256, num_gqa_groups=4, attn_mask_type="causal", window_size=(768, 0)
+    ),  # D=256 counterpart of cp_2_7
 }
 
 
@@ -559,6 +572,7 @@ if test_essential:
         "cp_2_1",
         "cp_2_2",
         "cp_2_4",
+        "cp_2_7",
         "cp_3_1",
         "cp_3_2",
         "cp_3_4",
@@ -566,6 +580,7 @@ if test_essential:
         "cp_4_3",
         "cp_5_0",
         "cp_5_1",
+        "cp_5_2",
     ]
     model_configs_fused_attn = {k: model_configs_fused_attn[k] for k in configs}
     dtypes = ["bf16", "fp8"]
@@ -641,11 +656,10 @@ def test_cp_with_fused_attention(
     if config.attn_bias_type != "no_bias" and cp_comm_type in ["all_gather", "a2a", "a2a+p2p"]:
         pytest.skip("No support for bias with cp_comm_type={all_gather, a2a, a2a+p2p}!")
 
-    if (config.window_size[0] != -1 or config.window_size[1] not in [-1, 0]) and cp_comm_type in [
-        "p2p",
-        "a2a+p2p",
-    ]:
-        pytest.skip("No support for SWA with cp_comm_type={p2p, a2a+p2p}!")
+    if (
+        config.window_size[0] != -1 or config.window_size[1] not in [-1, 0]
+    ) and cp_comm_type == "a2a+p2p":
+        pytest.skip("No support for SWA with cp_comm_type=a2a+p2p!")
 
     if cp_comm_type in ["a2a", "a2a+p2p"] and (
         config.num_heads % 2 != 0 or config.num_gqa_groups % 2 != 0
@@ -806,6 +820,54 @@ def test_cp_with_flash_attention_no_load_balance(cp_pool):
         cp_comm_type="all_gather",
         fa_pad_between_seqs=False,
         load_balancing_strategy="NO_LOAD_BALANCE",
+        deterministic=_deterministic,
+        log_level=pytest_logging_level,
+    )
+
+
+@pytest.mark.skipif(get_cudnn_version() < (8, 9, 7), reason="cuDNN 8.9.7+ is required.")
+@pytest.mark.skipif(get_device_compute_capability() < (8, 0), reason="CP tests require sm80+.")
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+@pytest.mark.parametrize("model", ["cp_2_7", "cp_5_2"])
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd"])
+@pytest.mark.parametrize("cp_size", [2, 3, 4])
+@pytest.mark.parametrize("window_size_left", [1, 96, 384, 768, 1024])
+@pytest.mark.parametrize("is_training", [True, False])
+def test_cp_with_fused_attention_p2p_swa(
+    cp_pool, dtype, model, qkv_format, cp_size, window_size_left, is_training
+):
+    """Sliding window attention with cp_comm_type="p2p", which fetches only the windowed K/V
+    preceding each sequence chunk from the ranks that own it.
+
+    The configs have 3072 tokens, so the chunk length is 768, 512 and 384 at CP2, CP3 and
+    CP4, and the windows span from a fraction of a chunk to almost three chunks. Windows wider
+    than (cp_size - 1) chunks fall back to all_gather, which the runner also checks.
+    """
+    config = copy.deepcopy(model_configs_fused_attn[model])
+    config.context_parallel = True
+    config.cp_comm_type = "p2p"
+    config.window_size = (window_size_left, 0)
+    chunk_len = config.max_seqlen_q // (2 * cp_size)
+    available_backends, *_ = get_available_attention_backends(
+        config,
+        qkv_dtype={"fp16": torch.float16, "bf16": torch.bfloat16}[dtype],
+        qkv_layout="_".join([qkv_format] * 3),
+        is_training=is_training,
+        deterministic=_deterministic,
+        cp_size=cp_size,
+    )
+    if not available_backends[1]:
+        pytest.skip("No attention backend available.")
+    _submit(
+        cp_pool(cp_size),
+        dtype=dtype,
+        model=model,
+        qkv_format=qkv_format,
+        kernel_backend="FusedAttention",
+        cp_comm_type="p2p",
+        window_size_left=window_size_left,
+        expect_p2p_swa=window_size_left <= (cp_size - 1) * chunk_len,
+        is_training=is_training,
         deterministic=_deterministic,
         log_level=pytest_logging_level,
     )

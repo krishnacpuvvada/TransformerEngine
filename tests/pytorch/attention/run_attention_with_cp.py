@@ -6,12 +6,15 @@ import copy
 import os
 import sys
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import torch
 import torch.distributed as dist
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
     get_cu_seqlens_on_cp_rank,
     get_thd_partitioned_indices,
+)
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_swa import (
+    AttnFuncWithCPAndKVP2PSWA,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import combine_and_quantize
 from transformer_engine.pytorch import DType
@@ -45,6 +48,27 @@ _pool_cp_comm_group = None
 _pool_cp_comm_sub_groups: list = []
 
 dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.bfloat16}
+
+
+@contextmanager
+def count_p2p_swa_calls():
+    """Yield a list that gets one entry per AttnFuncWithCPAndKVP2PSWA.apply call.
+
+    The sliding-window p2p path and its all_gather fallback produce the same numerics, so
+    a test that expects the p2p path has to check that it actually ran.
+    """
+    calls = []
+    apply = AttnFuncWithCPAndKVP2PSWA.apply
+
+    def counting_apply(*args):
+        calls.append(1)
+        return apply(*args)
+
+    AttnFuncWithCPAndKVP2PSWA.apply = counting_apply
+    try:
+        yield calls
+    finally:
+        del AttnFuncWithCPAndKVP2PSWA.apply
 
 
 def generate_input_shapes(
@@ -235,6 +259,8 @@ def run_dpa_with_cp(
     deterministic="False",
     load_balancing_strategy="DUAL_CHUNK_SWAP",
     softcap="0.0",
+    window_size_left="-1",
+    expect_p2p_swa="False",
     log_level=logging.WARNING,
 ):
     """Test DotProductAttention module with context parallelism"""
@@ -283,6 +309,8 @@ def run_dpa_with_cp(
         else:
             config.attn_mask_type = "padding"
     config.softcap = float(softcap)
+    if int(window_size_left) >= 0:
+        config.window_size = (int(window_size_left), 0)
 
     # set up distributed group
     rank = int(os.getenv("RANK", "0"))
@@ -578,7 +606,8 @@ def run_dpa_with_cp(
 
     # run attention
     max_logit_ = None
-    with fp8_context:
+    p2p_swa_context = count_p2p_swa_calls() if expect_p2p_swa == "True" else nullcontext([])
+    with fp8_context, p2p_swa_context as p2p_swa_calls:
         # q, k, v, out in FP8; dout in F16
         out_ = core_attn(
             q_,
@@ -593,6 +622,8 @@ def run_dpa_with_cp(
             pad_between_seqs=pad_between_seqs,
             fp8_output=fp8_mha,
         )
+        if expect_p2p_swa == "True":
+            assert len(p2p_swa_calls) == 1, "Sliding window attention did not run on the p2p path!"
         if config.return_max_logit:
             out_, max_logit_ = out_
         if is_training:
