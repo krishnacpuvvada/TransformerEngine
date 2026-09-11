@@ -15,6 +15,7 @@ from transformer_engine.pytorch.attention.dot_product_attention.context_parallel
 )
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_swa import (
     AttnFuncWithCPAndKVP2PSWA,
+    use_p2p_swa,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import combine_and_quantize
 from transformer_engine.pytorch import DType
@@ -399,6 +400,20 @@ def run_dpa_with_cp(
         fa_pad_between_seqs,
         load_balancing_strategy,
     )
+    # THD passes the longest padded sequence explicitly so that both runs, and the route
+    # expectation below, see the same max_seqlen instead of DotProductAttention's rounded guess.
+    max_seqlen_kwargs = {}
+    if qkv_format == "thd":
+        max_seqlen = int((cu_seqlens_q_padded[1:] - cu_seqlens_q_padded[:-1]).max())
+        max_seqlen_kwargs = {"max_seqlen_q": max_seqlen, "max_seqlen_kv": max_seqlen}
+    else:
+        max_seqlen = config.max_seqlen_q
+    if expect_p2p_swa == "auto":
+        expect_p2p_swa = str(
+            use_p2p_swa(
+                qkv_format, config.attn_mask_type, config.window_size, max_seqlen, world_size
+            )
+        )
     q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
@@ -491,6 +506,7 @@ def run_dpa_with_cp(
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             pad_between_seqs=pad_between_seqs,
             fp8_output=fp8_mha,
+            **max_seqlen_kwargs,
         )
         if config.return_max_logit:
             out, max_logit = out
@@ -621,6 +637,7 @@ def run_dpa_with_cp(
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             pad_between_seqs=pad_between_seqs,
             fp8_output=fp8_mha,
+            **max_seqlen_kwargs,
         )
         if expect_p2p_swa == "True":
             assert len(p2p_swa_calls) == 1, "Sliding window attention did not run on the p2p path!"

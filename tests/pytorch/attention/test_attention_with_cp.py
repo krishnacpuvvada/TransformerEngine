@@ -829,7 +829,7 @@ def test_cp_with_flash_attention_no_load_balance(cp_pool):
 @pytest.mark.skipif(get_device_compute_capability() < (8, 0), reason="CP tests require sm80+.")
 @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize("model", ["cp_2_7", "cp_5_2"])
-@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd"])
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "thd"])
 @pytest.mark.parametrize("cp_size", [2, 3, 4])
 @pytest.mark.parametrize("window_size_left", [1, 96, 384, 768, 1024])
 @pytest.mark.parametrize("is_training", [True, False])
@@ -839,14 +839,20 @@ def test_cp_with_fused_attention_p2p_swa(
     """Sliding window attention with cp_comm_type="p2p", which fetches only the windowed K/V
     preceding each sequence chunk from the ranks that own it.
 
-    The configs have 3072 tokens, so the chunk length is 768, 512 and 384 at CP2, CP3 and
-    CP4, and the windows span from a fraction of a chunk to almost three chunks. Windows wider
-    than (cp_size - 1) chunks fall back to all_gather, which the runner also checks.
+    The dense configs have 3072 tokens, so the chunk length is 768, 512 and 384 at CP2, CP3
+    and CP4, and the windows span from a fraction of a chunk to almost three chunks. Windows
+    wider than (cp_size - 1) chunks fall back to all_gather, which the runner also checks.
+    THD packs two sequences of random length up to 3072 tokens, so the runner derives the
+    expected route from the lengths it generated.
     """
+    if qkv_format == "thd" and get_device_compute_capability() < (9, 0):
+        pytest.skip("Only sm90+ architectures support THD format!")
     config = copy.deepcopy(model_configs_fused_attn[model])
     config.context_parallel = True
     config.cp_comm_type = "p2p"
     config.window_size = (window_size_left, 0)
+    if qkv_format == "thd":
+        config.attn_mask_type = "padding_causal"
     chunk_len = config.max_seqlen_q // (2 * cp_size)
     available_backends, *_ = get_available_attention_backends(
         config,
@@ -866,7 +872,9 @@ def test_cp_with_fused_attention_p2p_swa(
         kernel_backend="FusedAttention",
         cp_comm_type="p2p",
         window_size_left=window_size_left,
-        expect_p2p_swa=window_size_left <= (cp_size - 1) * chunk_len,
+        expect_p2p_swa=(
+            "auto" if qkv_format == "thd" else window_size_left <= (cp_size - 1) * chunk_len
+        ),
         is_training=is_training,
         deterministic=_deterministic,
         log_level=pytest_logging_level,
