@@ -189,6 +189,64 @@ def _unpack(staged, seq_dim, accumulate):
                 dst.copy_(piece)
 
 
+def _gather_halos(
+    k,
+    v,
+    chunks,
+    chunk_lens,
+    doc_starts,
+    ext_total,
+    window,
+    rank,
+    cp_size,
+    seq_dim,
+    cp_group,
+    cp_global_ranks,
+):
+    """K/V for each half's attention call: per sequence ``[halo, chunk]`` along the sequence
+    axis. Own chunks and halo pieces this rank owns are copied, the other pieces are received
+    from their owners. Returns the buffers, the exchange requests with their staged receive
+    buffers, and per half whether it depends on the exchange. Called by forward and again by
+    backward, so that only the local K and V are saved between the two."""
+    k_ext, v_ext = (
+        [
+            torch.empty(_seq_shape(x.shape, seq_dim, total), dtype=x.dtype, device=x.device)
+            for total in ext_total
+        ]
+        for x in [k, v]
+    )
+    for c in chunks:
+        for x, ext in [(k, k_ext), (v, v_ext)]:
+            ext[c.half].narrow(seq_dim, c.ext_start + c.halo, c.length).copy_(
+                x.narrow(seq_dim, c.start, c.length)
+            )
+    transfers = [({}, {}), ({}, {})]
+    needs_comm = [False, False]
+    for doc, length in enumerate(chunk_lens):
+        for piece in get_halo_pieces(cp_size, length, window):
+            src_rank = get_chunk_owner(piece.src_chunk, cp_size)
+            dst_rank = get_chunk_owner(piece.dst_chunk, cp_size)
+            if rank not in [src_rank, dst_rank]:
+                continue
+            dst_chunk = chunks[2 * doc + int(piece.dst_chunk >= cp_size)]
+            for x, ext, (sends, recvs) in zip([k, v], [k_ext, v_ext], transfers):
+                if src_rank == rank == dst_rank:
+                    _dst_slice(ext, seq_dim, dst_chunk, piece).copy_(
+                        _src_slice(x, seq_dim, doc_starts[doc], length, piece, cp_size)
+                    )
+                elif src_rank == rank:
+                    sends.setdefault(dst_rank, []).append(
+                        _src_slice(x, seq_dim, doc_starts[doc], length, piece, cp_size)
+                    )
+                else:
+                    recvs.setdefault(src_rank, []).append(
+                        _dst_slice(ext, seq_dim, dst_chunk, piece)
+                    )
+                    needs_comm[dst_chunk.half] = True
+    reqs, staged = _exchange(transfers, seq_dim, k.dtype, cp_group, cp_global_ranks)
+    return k_ext, v_ext, reqs, staged, needs_comm
+
+
 def _packed_seqlens(chunks, ext_total, actual_lens, total_tokens, half, device):
     """cuDNN THD metadata for one half's call over all sequences: offsets of the queries in
     the local Q and their valid counts, offsets of each ``[halo, chunk]`` segment in the
@@ -272,45 +330,20 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
         chunks, ext_total = get_local_chunks(rank, cp_size, window, chunk_lens)
         doc_starts = [2 * sum(chunk_lens[:doc]) for doc in range(len(chunk_lens))]
 
-        # K/V for each half's attention call: per sequence [halo, chunk] along the sequence axis
-        k_ext, v_ext = (
-            [
-                torch.empty(_seq_shape(x.shape, seq_dim, total), dtype=x.dtype, device=x.device)
-                for total in ext_total
-            ]
-            for x in [k, v]
+        k_ext, v_ext, reqs, staged, needs_comm = _gather_halos(
+            k,
+            v,
+            chunks,
+            chunk_lens,
+            doc_starts,
+            ext_total,
+            window,
+            rank,
+            cp_size,
+            seq_dim,
+            cp_group,
+            cp_global_ranks,
         )
-        for c in chunks:
-            for x, ext in [(k, k_ext), (v, v_ext)]:
-                ext[c.half].narrow(seq_dim, c.ext_start + c.halo, c.length).copy_(
-                    x.narrow(seq_dim, c.start, c.length)
-                )
-
-        # halo pieces: copied when this rank owns both ends, otherwise exchanged
-        transfers = [({}, {}), ({}, {})]
-        needs_comm = [False, False]
-        for doc, length in enumerate(chunk_lens):
-            for piece in get_halo_pieces(cp_size, length, window):
-                src_rank = get_chunk_owner(piece.src_chunk, cp_size)
-                dst_rank = get_chunk_owner(piece.dst_chunk, cp_size)
-                if rank not in [src_rank, dst_rank]:
-                    continue
-                dst_chunk = chunks[2 * doc + int(piece.dst_chunk >= cp_size)]
-                for x, ext, (sends, recvs) in zip([k, v], [k_ext, v_ext], transfers):
-                    if src_rank == rank == dst_rank:
-                        _dst_slice(ext, seq_dim, dst_chunk, piece).copy_(
-                            _src_slice(x, seq_dim, doc_starts[doc], length, piece, cp_size)
-                        )
-                    elif src_rank == rank:
-                        sends.setdefault(dst_rank, []).append(
-                            _src_slice(x, seq_dim, doc_starts[doc], length, piece, cp_size)
-                        )
-                    else:
-                        recvs.setdefault(src_rank, []).append(
-                            _dst_slice(ext, seq_dim, dst_chunk, piece)
-                        )
-                        needs_comm[dst_chunk.half] = True
-        reqs, staged = _exchange(transfers, seq_dim, k.dtype, cp_group, cp_global_ranks)
 
         # attention per half, halves that need no communication first; packed outputs are
         # assembled from the valid tokens of each half, so they start from zeros
@@ -399,8 +432,8 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
 
         ctx.save_for_backward(
             q,
-            *k_ext,
-            *v_ext,
+            k,
+            v,
             out,
             *softmax_lse,
             *rng_state,
@@ -417,9 +450,9 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
         ctx.chunk_lens = chunk_lens
         ctx.doc_starts = doc_starts
         ctx.chunks = chunks
+        ctx.ext_total = ext_total
         ctx.max_seqlens = max_seqlens
         ctx.seqlens = seqlens
-        ctx.k_shape, ctx.v_shape = k.shape, v.shape
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
@@ -433,10 +466,9 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
     def backward(ctx, dout, *_args):
         # pylint: disable=missing-function-docstring,too-many-locals
         nvtx_range_push("transformer_engine.AttnFuncWithCPAndKVP2PSWA.backward")
-        q, *saved = ctx.saved_tensors
-        k_ext, v_ext, out = saved[0:2], saved[2:4], saved[4]
-        softmax_lse, rng_state = saved[5:7], saved[7:9]
-        cu_seqlens_per_half = [saved[9:13], saved[13:17]]
+        q, k, v, out, *saved = ctx.saved_tensors
+        softmax_lse, rng_state = saved[0:2], saved[2:4]
+        cu_seqlens_per_half = [saved[4:8], saved[8:12]]
 
         cp_size = get_distributed_world_size(ctx.cp_group)
         rank = get_distributed_rank(ctx.cp_group)
@@ -444,13 +476,33 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
         seq_dim, chunks = ctx.seq_dim, ctx.chunks
         dout = dout.contiguous()
 
+        k_ext, v_ext, reqs, staged, needs_comm = _gather_halos(
+            k,
+            v,
+            chunks,
+            ctx.chunk_lens,
+            ctx.doc_starts,
+            ctx.ext_total,
+            ctx.window,
+            rank,
+            cp_size,
+            seq_dim,
+            ctx.cp_group,
+            ctx.cp_global_ranks,
+        )
         dq = torch.zeros_like(q) if packed else torch.empty_like(q)
         # a key may receive gradients from several query chunks; accumulate them in float32
         # and round once at the end, so the result does not depend on the accumulation order
-        dk = torch.empty(ctx.k_shape, dtype=torch.float32, device=q.device)
-        dv = torch.empty(ctx.v_shape, dtype=torch.float32, device=q.device)
+        dk = torch.empty(k.shape, dtype=torch.float32, device=k.device)
+        dv = torch.empty(v.shape, dtype=torch.float32, device=v.device)
         dk_ext, dv_ext = [None, None], [None, None]
-        for half in range(2):
+        waited = False
+        for half in sorted(range(2), key=lambda half: needs_comm[half]):
+            if needs_comm[half] and not waited:
+                for req in reqs:
+                    req.wait()
+                _unpack(staged, seq_dim, accumulate=False)
+                waited = True
             cu_q, q_offsets, cu_kv, kv_offsets = cu_seqlens_per_half[half]
             chunk = chunks[half]  # dense inputs have one chunk per half
             if packed:
