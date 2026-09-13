@@ -145,12 +145,13 @@ def _dst_slice(ext, seq_dim, chunk, piece):
     return ext[chunk.half].narrow(seq_dim, chunk.ext_start + piece.dst_start, piece.length)
 
 
-def _exchange(transfers, seq_dim, cp_group, cp_global_ranks):
+def _exchange(transfers, seq_dim, dtype, cp_group, cp_global_ranks):
     """Post the halo exchange as one batched point-to-point operation.
 
     ``transfers`` holds ``(sends, recvs)`` pairs, one per tensor kind (K, V), where ``sends``
     and ``recvs`` map a peer rank to its slices in the global piece order. Pieces for one peer
     travel in one message, so the message count does not grow with the number of sequences.
+    ``dtype`` is the dtype on the wire; a destination slice may hold a wider dtype.
     Returns the requests and the receive buffers paired with their destination slices.
     """
     ops, staged = [], []
@@ -167,9 +168,7 @@ def _exchange(transfers, seq_dim, cp_group, cp_global_ranks):
         for peer, slices in recvs.items():
             total = sum(s.shape[seq_dim] for s in slices)
             buf = torch.empty(
-                _seq_shape(slices[0].shape, seq_dim, total),
-                dtype=slices[0].dtype,
-                device=slices[0].device,
+                _seq_shape(slices[0].shape, seq_dim, total), dtype=dtype, device=slices[0].device
             )
             ops.append(
                 torch.distributed.P2POp(
@@ -311,7 +310,7 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
                             _dst_slice(ext, seq_dim, dst_chunk, piece)
                         )
                         needs_comm[dst_chunk.half] = True
-        reqs, staged = _exchange(transfers, seq_dim, cp_group, cp_global_ranks)
+        reqs, staged = _exchange(transfers, seq_dim, k.dtype, cp_group, cp_global_ranks)
 
         # attention per half, halves that need no communication first; packed outputs are
         # assembled from the valid tokens of each half, so they start from zeros
@@ -446,8 +445,10 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
         dout = dout.contiguous()
 
         dq = torch.zeros_like(q) if packed else torch.empty_like(q)
-        dk = torch.empty(ctx.k_shape, dtype=q.dtype, device=q.device)
-        dv = torch.empty(ctx.v_shape, dtype=q.dtype, device=q.device)
+        # a key may receive gradients from several query chunks; accumulate them in float32
+        # and round once at the end, so the result does not depend on the accumulation order
+        dk = torch.empty(ctx.k_shape, dtype=torch.float32, device=q.device)
+        dv = torch.empty(ctx.v_shape, dtype=torch.float32, device=q.device)
         dk_ext, dv_ext = [None, None], [None, None]
         for half in range(2):
             cu_q, q_offsets, cu_kv, kv_offsets = cu_seqlens_per_half[half]
@@ -494,8 +495,7 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
                         grad_ext[half].narrow(seq_dim, chunk.ext_start + chunk.halo, chunk.length)
                     )
 
-        # return halo gradients to the owners of the pieces and accumulate them there; the
-        # piece order is the same on every run, which keeps the accumulation deterministic
+        # return halo gradients to the owners of the pieces and accumulate them there
         transfers = [({}, {}), ({}, {})]
         for doc, length in enumerate(ctx.chunk_lens):
             for piece in get_halo_pieces(cp_size, length, ctx.window):
@@ -517,7 +517,7 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
                         recvs.setdefault(dst_rank, []).append(
                             _src_slice(grad, seq_dim, ctx.doc_starts[doc], length, piece, cp_size)
                         )
-        reqs, staged = _exchange(transfers, seq_dim, ctx.cp_group, ctx.cp_global_ranks)
+        reqs, staged = _exchange(transfers, seq_dim, q.dtype, ctx.cp_group, ctx.cp_global_ranks)
         for req in reqs:
             req.wait()
         _unpack(staged, seq_dim, accumulate=True)
@@ -541,6 +541,7 @@ class AttnFuncWithCPAndKVP2PSWA(torch.autograd.Function):
             )
             for grad in [dq, dk, dv]:
                 grad[padding] = 0
+        dk, dv = dk.to(q.dtype), dv.to(q.dtype)
 
         nvtx_range_pop("transformer_engine.AttnFuncWithCPAndKVP2PSWA.backward")
         return (None, dq, dk, dv) + (None,) * 12
